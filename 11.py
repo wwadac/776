@@ -2,7 +2,7 @@ import logging
 from aiogram import Bot, Dispatcher, types, executor
 from moviepy.editor import *
 
-API_TOKEN = "7977469319:AAGWsXON1zGZnXUo8kmnM_ehRBbRekfsNTU"
+API_TOKEN = "8445402631:AAG7EhMBYzljYIawRiD8Wh0tICFVESrSKdY"
 
 
 logging.basicConfig(level=logging.INFO)
@@ -43,4 +43,5 @@ dp.register_message_handler(start, commands=["start"])
 dp.register_message_handler(process_video, content_types=types.ContentType.VIDEO)
 
 if __name__ == "__main__":
+
     executor.start_polling(dp, skip_updates=True)
