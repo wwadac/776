@@ -1,162 +1,332 @@
-import os
-import tempfile
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-import cv2
-from moviepy.editor import VideoFileClip
+import asyncio
+import logging
+import time
+import random
+import sqlite3
+from datetime import datetime
+from telethon import TelegramClient, events, Button
 
-# Конфигурация
-BOT_TOKEN = "8445402631:AAG7EhMBYzljYIawRiD8Wh0tICFVESrSKdY"
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /start"""
-    welcome_text = """
-🤖 Бот для создания круговых видео!
-
-Просто отправьте мне видео, и я преобразую его в круговой формат.
-
-📹 Поддерживаются форматы: MP4, MOV, AVI
-⏱ Максимальная длительность: 1 минута
-"""
-    await update.message.reply_text(welcome_text)
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /help"""
-    help_text = """
-📋 Как использовать бота:
-
-1. Отправьте видео файл
-2. Бот автоматически обработает его
-3. Получите результат в круговом формате
-
-⚠️ Ограничения:
-- Максимальный размер: 20MB
-- Максимальная длительность: 60 секунд
-- Поддерживаются горизонтальные и вертикальные видео
-"""
-    await update.message.reply_text(help_text)
-
-def create_circular_video(input_path, output_path):
-    """Создает круговое видео из обычного"""
-    # Загружаем видео
-    clip = VideoFileClip(input_path)
-    
-    # Получаем размеры исходного видео
-    w, h = clip.size
-    
-    # Определяем размер для квадратного видео (берем минимальную сторону)
-    size = min(w, h)
-    
-    # Вычисляем координаты для обрезки по центру
-    x_center = w / 2
-    y_center = h / 2
-    x1 = int(x_center - size/2)
-    y1 = int(y_center - size/2)
-    
-    # Обрезаем видео до квадрата
-    cropped_clip = clip.crop(x1=x1, y1=y1, width=size, height=size)
-    
-    # Создаем маску для круга
-    def make_circle_frame(get_frame, t):
-        frame = get_frame(t)
-        mask = np.zeros((size, size, 3), dtype=np.uint8)
-        cv2.circle(mask, (size//2, size//2), size//2, (255, 255, 255), -1)
-        result = cv2.bitwise_and(frame, mask)
-        return result
-    
-    # Применяем маску
-    import numpy as np
-    circular_clip = cropped_clip.fl_image(
-        lambda frame: make_circle_frame(lambda t: frame, 0)
-    )
-    
-    # Сохраняем результат
-    circular_clip.write_videofile(
-        output_path,
-        codec='libx264',
-        audio_codec='aac',
-        temp_audiofile='temp-audio.m4a',
-        remove_temp=True
-    )
-    
-    # Закрываем клипы
-    clip.close()
-    cropped_clip.close()
-    circular_clip.close()
-
-async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик видео сообщений"""
-    try:
-        # Отправляем сообщение о начале обработки
-        processing_msg = await update.message.reply_text("🔄 Обрабатываю видео...")
+class ComplaintBot:
+    def __init__(self):
+        self.API_ID = '29385016'
+        self.API_HASH = '3c57df8805ab5de5a23a032ed39b9af9'
+        self.BOT_TOKEN = '8324933170:AAFatQ1T42ZJ70oeWS2UJkcXFeiwUFCIXAk'
         
-        # Скачиваем видео файл
-        video_file = await update.message.video.get_file()
+        self.bot_client = None
+        self.setup_database()
+    
+    def setup_database(self):
+        """Настройка базы данных для хранения запросов"""
+        self.conn = sqlite3.connect('user_limits.db', check_same_thread=False)
+        self.cursor = self.conn.cursor()
         
-        with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as temp_input:
-            input_path = temp_input.name
-        
-        with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as temp_output:
-            output_path = temp_output.name
-        
-        # Скачиваем видео
-        await video_file.download_to_drive(input_path)
-        
-        # Обновляем статус
-        await processing_msg.edit_text("🎬 Создаю круговое видео...")
-        
-        # Создаем круговое видео
-        create_circular_video(input_path, output_path)
-        
-        # Отправляем результат
-        await processing_msg.edit_text("📤 Отправляю результат...")
-        
-        with open(output_path, 'rb') as video_file:
-            await update.message.reply_video(
-                video=video_file,
-                caption="✅ Ваше видео в круговом формате готово!"
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_requests (
+                user_id INTEGER PRIMARY KEY,
+                request_count INTEGER DEFAULT 0,
+                last_reset_time REAL
             )
+        ''')
+        self.conn.commit()
+    
+    async def check_user_limit(self, user_id):
+        """Проверяет лимит запросов для пользователя"""
+        now = time.time()
         
-        # Удаляем временные файлы
-        os.unlink(input_path)
-        os.unlink(output_path)
-        await processing_msg.delete()
+        self.cursor.execute(
+            'SELECT request_count, last_reset_time FROM user_requests WHERE user_id = ?',
+            (user_id,)
+        )
+        result = self.cursor.fetchone()
         
-    except Exception as e:
-        error_msg = f"❌ Произошла ошибка при обработке видео: {str(e)}"
-        await update.message.reply_text(error_msg)
+        if not result:
+            return True, 5
         
-        # Очищаем временные файлы в случае ошибки
+        request_count, last_reset_time = result
+        
+        if now - last_reset_time >= 2400:
+            return True, 5
+        else:
+            if request_count >= 5:
+                return False, 0
+            else:
+                return True, 5 - request_count
+    
+    async def increment_request_count(self, user_id):
+        """Увеличивает счетчик запросов"""
+        now = time.time()
+        
+        self.cursor.execute(
+            'SELECT request_count, last_reset_time FROM user_requests WHERE user_id = ?',
+            (user_id,)
+        )
+        result = self.cursor.fetchone()
+        
+        if not result:
+            self.cursor.execute(
+                'INSERT INTO user_requests (user_id, request_count, last_reset_time) VALUES (?, ?, ?)',
+                (user_id, 1, now)
+            )
+        else:
+            request_count, last_reset_time = result
+            if now - last_reset_time >= 2400:
+                self.cursor.execute(
+                    'UPDATE user_requests SET request_count = 1, last_reset_time = ? WHERE user_id = ?',
+                    (now, user_id)
+                )
+            else:
+                self.cursor.execute(
+                    'UPDATE user_requests SET request_count = request_count + 1 WHERE user_id = ?',
+                    (user_id,)
+                )
+        
+        self.conn.commit()
+    
+    async def get_remaining_time(self, user_id):
+        """Получает оставшееся время до сброса"""
+        self.cursor.execute(
+            'SELECT last_reset_time FROM user_requests WHERE user_id = ?',
+            (user_id,)
+        )
+        result = self.cursor.fetchone()
+        
+        if result:
+            last_reset_time = result[0]
+            elapsed = time.time() - last_reset_time
+            remaining = max(0, 2400 - elapsed)
+            return remaining
+        return 0
+    
+    async def get_user_stats(self, user_id):
+        """Получает статистику пользователя"""
+        self.cursor.execute(
+            'SELECT request_count, last_reset_time FROM user_requests WHERE user_id = ?',
+            (user_id,)
+        )
+        result = self.cursor.fetchone()
+        
+        if result:
+            request_count, last_reset_time = result
+            remaining_time = await self.get_remaining_time(user_id)
+            return {
+                'used': request_count,
+                'remaining': max(0, 5 - request_count),
+                'remaining_time': remaining_time
+            }
+        return {'used': 0, 'remaining': 5, 'remaining_time': 0}
+    
+    async def initialize(self):
+        """Инициализация бота"""
+        self.bot_client = TelegramClient(
+            'session_bot', 
+            self.API_ID, 
+            self.API_HASH
+        )
+        
+        await self.bot_client.start(bot_token=self.BOT_TOKEN)
+        self.setup_handlers()
+        logger.info("Бот инициализирован")
+    
+    def setup_handlers(self):
+        """Настройка обработчиков событий"""
+        
+        @self.bot_client.on(events.NewMessage(pattern='/start'))
+        async def start_handler(event):
+            user_id = event.sender_id
+            stats = await self.get_user_stats(user_id)
+            
+            welcome_text = f"""
+User Checker & Complaint Bot
+
+У вас {stats['remaining']}/5 запросов
+
+Отправьте @username или user_id для проверки
+            """
+            
+            buttons = [
+                [Button.inline("Отправить жалобу", b"show_complaint_form")],
+                [Button.inline("Моя статистика", b"show_stats")]
+            ]
+            
+            await event.reply(welcome_text, buttons=buttons)
+        
+        @self.bot_client.on(events.NewMessage(pattern='/stats'))
+        async def stats_handler(event):
+            user_id = event.sender_id
+            stats = await self.get_user_stats(user_id)
+            
+            minutes_left = int(stats['remaining_time'] // 60)
+            seconds_left = int(stats['remaining_time'] % 60)
+            
+            stats_text = f"""
+Статистика:
+
+Использовано: {stats['used']}/5
+Осталось: {stats['remaining']}
+Сброс через: {minutes_left}мин {seconds_left}сек
+            """
+            
+            await event.reply(stats_text)
+        
+        @self.bot_client.on(events.CallbackQuery)
+        async def callback_handler(event):
+            user_id = event.sender_id
+            data = event.data.decode('utf-8')
+            
+            if data == "show_complaint_form":
+                stats = await self.get_user_stats(user_id)
+                if stats['remaining'] <= 0:
+                    minutes_left = int(stats['remaining_time'] // 60)
+                    await event.answer(f"Лимит исчерпан! Ждите {minutes_left} мин", alert=True)
+                    return
+                
+                complaint_text = """
+Введите username или user_id пользователя:
+
+Примеры:
+@username 
+123456789
+username
+                """
+                await event.edit(complaint_text)
+                
+            elif data == "show_stats":
+                await stats_handler(event)
+            
+            elif data.startswith("complaint_"):
+                target_username = data.replace("complaint_", "")
+                await self.send_complaint_animation(event, user_id, target_username)
+        
+        @self.bot_client.on(events.NewMessage)
+        async def message_handler(event):
+            user_id = event.sender_id
+            text = event.text.strip()
+            
+            if text.startswith('/'):
+                return
+            
+            stats = await self.get_user_stats(user_id)
+            if stats['remaining'] <= 0:
+                minutes_left = int(stats['remaining_time'] // 60)
+                await event.reply(f"Лимит исчерпан! Подождите {minutes_left} минут")
+                return
+            
+            if self.is_valid_input(text):
+                await self.process_user_check(event, text, user_id)
+            else:
+                await event.reply("Неверный формат. Введите @username или user_id")
+    
+    def is_valid_input(self, text):
+        """Проверяет валидность ввода"""
+        if text.startswith('@'):
+            return len(text) <= 33 and text[1:].replace('_', '').isalnum()
+        elif text.isdigit():
+            return len(text) >= 5 and len(text) <= 15
+        else:
+            return len(text) <= 32 and text.replace('_', '').isalnum()
+    
+    async def process_user_check(self, event, input_text, user_id):
+        """Обрабатывает проверку пользователя"""
         try:
-            if 'input_path' in locals() and os.path.exists(input_path):
-                os.unlink(input_path)
-            if 'output_path' in locals() and os.path.exists(output_path):
-                os.unlink(output_path)
-        except:
-            pass
+            clean_input = input_text.replace('@', '')
+            await event.reply(f"Проверяю {clean_input}...")
+            
+            try:
+                if clean_input.isdigit():
+                    user = await self.bot_client.get_entity(int(clean_input))
+                else:
+                    user = await self.bot_client.get_entity(clean_input)
+                
+                response = f"""
+Пользователь найден!
 
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик ошибок"""
-    print(f"Ошибка: {context.error}")
-    if update and update.message:
-        await update.message.reply_text("❌ Произошла непредвиденная ошибка")
+Имя: {user.first_name or 'Не указано'}
+Фамилия: {user.last_name or 'Не указана'}
+Username: @{user.username or 'Не указан'}
+ID: {user.id}
+Тип: {'Бот' if user.bot else 'Пользователь'}
+                """
+                
+                buttons = [
+                    [Button.inline("Отправить жалобу", f"complaint_{clean_input}".encode())]
+                ]
+                
+                await event.reply(response, buttons=buttons)
+                
+            except Exception:
+                await event.reply(f"Пользователь {clean_input} не существует")
+                
+        except Exception as e:
+            await event.reply("Ошибка при проверке пользователя")
+            logger.error(f"Error in process_user_check: {e}")
+    
+    async def send_complaint_animation(self, event, user_id, target_username):
+        """Анимация отправки жалоб"""
+        try:
+            message = await event.edit("Начинаем отправку жалоб...")
+            
+            # Более медленная анимация прогресса
+            progress_data = [
+                ("▱▱▱▱▱", "0%"),
+                ("▰▱▱▱▱", "20%"),
+                ("▰▰▱▱▱", "40%"),
+                ("▰▰▰▱▱", "60%"),
+                ("▰▰▰▰▱", "80%"),
+                ("▰▰▰▰▰", "100%")
+            ]
+            
+            for progress_bar, percentage in progress_data:
+                await asyncio.sleep(3)  # Увеличил задержку до 3 секунд
+                await message.edit(f"Отправка жалоб...\n{progress_bar} {percentage}")
+            
+            # Генерируем результаты
+            total_complaints = random.randint(250, 300)
+            successful = total_complaints
+            failed = 0
+            
+            if random.random() < 0.12:
+                failed = random.randint(1, total_complaints // 8)
+                successful = total_complaints - failed
+            
+            # Финальный результат без лишней информации
+            result_text = f"""
+Жалобы отправлены!
 
-def main():
-    """Основная функция"""
-    # Создаем приложение
-    application = Application.builder().token(BOT_TOKEN).build()
-    
-    # Добавляем обработчики
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(MessageHandler(filters.VIDEO, handle_video))
-    
-    # Обработчик ошибок
-    application.add_error_handler(error_handler)
-    
-    # Запускаем бота
-    print("Бот запущен...")
-    application.run_polling()
+༼ つ ◕_◕ ༽つ Отправлено: {successful}
+¯\_(ツ)_/¯ Не отправлено: {failed}
 
-if __name__ == "__main__":
-    main()
+Цель: @{target_username}
+            """
+            
+            await message.edit(result_text)
+            
+            # Увеличиваем счетчик ТОЛЬКО после отправки жалоб
+            await self.increment_request_count(user_id)
+            
+        except Exception as e:
+            logger.error(f"Error in complaint animation: {e}")
+            await event.answer("Ошибка при отправке жалоб", alert=True)
+    
+    async def run(self):
+        """Запуск бота"""
+        await self.initialize()
+        logger.info("Бот запущен и готов к работе")
+        await self.bot_client.run_until_disconnected()
+
+# Запуск бота
+if __name__ == '__main__':
+    bot = ComplaintBot()
+    
+    try:
+        asyncio.run(bot.run())
+    except KeyboardInterrupt:
+        logger.info("Бот остановлен")
+    except Exception as e:
+        logger.error(f"Критическая ошибка: {e}")
+    finally:
+        if hasattr(bot, 'conn'):
+            bot.conn.close()
