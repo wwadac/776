@@ -1,68 +1,162 @@
-import logging
-from aiogram import Bot, Dispatcher, types
-from aiogram.enums import ParseMode
-from aiogram.filters import Command
-from aiogram.types import Message
-from aiogram import F
-from moviepy.editor import *
+import os
+import tempfile
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import cv2
+from moviepy.editor import VideoFileClip
 
-API_TOKEN = "8445402631:AAG7EhMBYzljYIawRiD8Wh0tICFVESrSKdY"
+# Конфигурация
+BOT_TOKEN = "8445402631:AAG7EhMBYzljYIawRiD8Wh0tICFVESrSKdY"
 
-logging.basicConfig(level=logging.INFO)
-bot = Bot(token=API_TOKEN)
-dp = Dispatcher(bot)
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start"""
+    welcome_text = """
+🤖 Бот для создания круговых видео!
 
-@dp.message(Command("start"))
-async def start_handler(message: Message):
-    await message.answer("Отправьте мне видео, и я преобразую его в видеокружок.\nНе забудьте разрешить ГС если вы их ограничили")
+Просто отправьте мне видео, и я преобразую его в круговой формат.
 
-@dp.message(F.content_type == "video")
-async def process_video(message: Message):
+📹 Поддерживаются форматы: MP4, MOV, AVI
+⏱ Максимальная длительность: 1 минута
+"""
+    await update.message.reply_text(welcome_text)
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /help"""
+    help_text = """
+📋 Как использовать бота:
+
+1. Отправьте видео файл
+2. Бот автоматически обработает его
+3. Получите результат в круговом формате
+
+⚠️ Ограничения:
+- Максимальный размер: 20MB
+- Максимальная длительность: 60 секунд
+- Поддерживаются горизонтальные и вертикальные видео
+"""
+    await update.message.reply_text(help_text)
+
+def create_circular_video(input_path, output_path):
+    """Создает круговое видео из обычного"""
+    # Загружаем видео
+    clip = VideoFileClip(input_path)
+    
+    # Получаем размеры исходного видео
+    w, h = clip.size
+    
+    # Определяем размер для квадратного видео (берем минимальную сторону)
+    size = min(w, h)
+    
+    # Вычисляем координаты для обрезки по центру
+    x_center = w / 2
+    y_center = h / 2
+    x1 = int(x_center - size/2)
+    y1 = int(y_center - size/2)
+    
+    # Обрезаем видео до квадрата
+    cropped_clip = clip.crop(x1=x1, y1=y1, width=size, height=size)
+    
+    # Создаем маску для круга
+    def make_circle_frame(get_frame, t):
+        frame = get_frame(t)
+        mask = np.zeros((size, size, 3), dtype=np.uint8)
+        cv2.circle(mask, (size//2, size//2), size//2, (255, 255, 255), -1)
+        result = cv2.bitwise_and(frame, mask)
+        return result
+    
+    # Применяем маску
+    import numpy as np
+    circular_clip = cropped_clip.fl_image(
+        lambda frame: make_circle_frame(lambda t: frame, 0)
+    )
+    
+    # Сохраняем результат
+    circular_clip.write_videofile(
+        output_path,
+        codec='libx264',
+        audio_codec='aac',
+        temp_audiofile='temp-audio.m4a',
+        remove_temp=True
+    )
+    
+    # Закрываем клипы
+    clip.close()
+    cropped_clip.close()
+    circular_clip.close()
+
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик видео сообщений"""
     try:
-        video_file_id = message.video.file_id
-        file = await bot.get_file(video_file_id)
-        file_path = file.file_path
+        # Отправляем сообщение о начале обработки
+        processing_msg = await update.message.reply_text("🔄 Обрабатываю видео...")
         
-        # Download the video file
-        await bot.download_file(file_path, "input_video.mp4")
-
-        # Process the video
-        input_video = VideoFileClip("input_video.mp4")
-        w, h = input_video.size
-        circle_size = 360
-        aspect_ratio = float(w) / float(h)
+        # Скачиваем видео файл
+        video_file = await update.message.video.get_file()
         
-        if w > h:
-            new_w = int(circle_size * aspect_ratio)
-            new_h = circle_size
-        else:
-            new_w = circle_size
-            new_h = int(circle_size / aspect_ratio)
-            
-        resized_video = input_video.resize((new_w, new_h))
-        output_video = resized_video.crop(x_center=resized_video.w/2, y_center=resized_video.h/2, width=circle_size, height=circle_size)
-        output_video.write_videofile("output_video.mp4", codec="libx264", audio_codec="aac")
-
-        # Send video note
-        with open("output_video.mp4", "rb") as video:
-            await message.bot.send_video_note(
-                chat_id=message.chat.id, 
-                video_note=video, 
-                duration=int(output_video.duration), 
-                length=circle_size
+        with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as temp_input:
+            input_path = temp_input.name
+        
+        with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as temp_output:
+            output_path = temp_output.name
+        
+        # Скачиваем видео
+        await video_file.download_to_drive(input_path)
+        
+        # Обновляем статус
+        await processing_msg.edit_text("🎬 Создаю круговое видео...")
+        
+        # Создаем круговое видео
+        create_circular_video(input_path, output_path)
+        
+        # Отправляем результат
+        await processing_msg.edit_text("📤 Отправляю результат...")
+        
+        with open(output_path, 'rb') as video_file:
+            await update.message.reply_video(
+                video=video_file,
+                caption="✅ Ваше видео в круговом формате готово!"
             )
         
-        # Clean up temporary files
-        input_video.close()
-        output_video.close()
+        # Удаляем временные файлы
+        os.unlink(input_path)
+        os.unlink(output_path)
+        await processing_msg.delete()
         
     except Exception as e:
-        logging.error(f"Error processing video: {e}")
-        await message.answer("Произошла ошибка при обработке видео. Пожалуйста, попробуйте еще раз.")
+        error_msg = f"❌ Произошла ошибка при обработке видео: {str(e)}"
+        await update.message.reply_text(error_msg)
+        
+        # Очищаем временные файлы в случае ошибки
+        try:
+            if 'input_path' in locals() and os.path.exists(input_path):
+                os.unlink(input_path)
+            if 'output_path' in locals() and os.path.exists(output_path):
+                os.unlink(output_path)
+        except:
+            pass
 
-async def main():
-    await dp.start_polling(bot)
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик ошибок"""
+    print(f"Ошибка: {context.error}")
+    if update and update.message:
+        await update.message.reply_text("❌ Произошла непредвиденная ошибка")
+
+def main():
+    """Основная функция"""
+    # Создаем приложение
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Добавляем обработчики
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(MessageHandler(filters.VIDEO, handle_video))
+    
+    # Обработчик ошибок
+    application.add_error_handler(error_handler)
+    
+    # Запускаем бота
+    print("Бот запущен...")
+    application.run_polling()
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    main()
